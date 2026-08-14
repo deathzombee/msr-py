@@ -1,97 +1,98 @@
-import time
-import usb.core
-import usb.util
-import threading
-import queue
+#!/usr/bin/env python3
+"""Capture one card and export validated tracks for MagSpoof."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from msr import (
+    MSRDevice,
+    MSRError,
+    format_json,
+    format_magspoof,
+    identify_service_codes,
+    service_codes_consistent,
+    write_private,
+)
 
 
-class MSRDevice:
-    def __init__(self, vendor_id=0x0801, product_id=0x0003):
-        self.dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
-        if self.dev is None:
-            raise ValueError('Device not found')
-
-        # Detach kernel driver and claim interface
-        if self.dev.is_kernel_driver_active(0):
-            self.dev.detach_kernel_driver(0)
-        usb.util.claim_interface(self.dev, 0)
-
-        self.endpoint_address = 0x81  # Endpoint 1 IN
-        self.size = 64  # Endpoint size in bytes
-
-        self.running = True
-        self.exit_event = threading.Event()
-        self.data_queue = queue.Queue()
-        self.read_thread = threading.Thread(target=self._read_thread)
-        self.read_thread.start()
-
-    def _read_thread(self):
-        """ Continuously read data from the device. """
-        while not self.exit_event.is_set():
-            try:
-                data = self.dev.read(self.endpoint_address, self.size, timeout=5000)
-                self.data_queue.put(data)
-            except usb.core.USBTimeoutError:
-                continue
-            except usb.core.USBError as err:
-                if err.errno == 19:
-                    break
-                else:
-                    raise
-
-    def send_command(self, command):
-        """ Send a command to the MSR device using control transfer. """
-        bmRequestType = 0x21  # Host to device | Class | Interface
-        bRequest = 9  # SET_REPORT
-        wValue = 0x300  # Feature
-        wIndex = 0  # Interface
-        command = self._extend(command)
-        self.dev.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, command)
-
-    @staticmethod
-    def _extend(command, length=64):
-        """ add padding to cmd bytes to match the endpoint size """
-        return command + [0x00] * (length - len(command))
-
-    def get_response(self):
-        """ Get the next response from the device. """
-        try:
-            return self.data_queue.get_nowait()
-        except queue.Empty:
-            return None
-
-    def close(self):
-        """ Release the interface and close connection"""
-        self.exit_event.set()
-        self.read_thread.join()
-        usb.util.release_interface(self.dev, 0)
-        usb.util.dispose_resources(self.dev)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Capture one authorized magnetic-stripe card for MagSpoof"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="output filename, created with owner-only permissions",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("magspoof", "json"),
+        default="magspoof",
+        help="output format (default: magspoof)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds to wait for a swipe (default: 30)",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="replace an existing output file"
+    )
+    return parser.parse_args()
 
 
-msr = None
+def main() -> int:
+    args = parse_args()
+    if args.timeout <= 0:
+        print("error: --timeout must be greater than zero", file=sys.stderr)
+        return 2
 
-try:
-    msr = MSRDevice()
-    msr.send_command([0xC5, 0x1B, 0x6d])  # read raw data
+    try:
+        print("Reader ready; swipe one card...", file=sys.stderr)
+        with MSRDevice() as device:
+            tracks = device.capture(args.timeout)
+        service_codes = identify_service_codes(tracks)
+        content = (
+            format_magspoof(tracks)
+            if args.format == "magspoof"
+            else format_json(tracks)
+        )
+        write_private(args.output, content, overwrite=args.force)
+    except KeyboardInterrupt:
+        print("\nCapture cancelled.", file=sys.stderr)
+        return 130
+    except FileExistsError:
+        print(
+            f"error: {args.output!r} already exists; use --force to replace it",
+            file=sys.stderr,
+        )
+        return 1
+    except (MSRError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
-    while True:
-        response = msr.get_response()
-        if response is not None:
-            print("Response:", response)
-            msr.send_command([0xC5, 0x1B, 0x6d])
-        time.sleep(0.5)
-except usb.core.USBError as e:
-    print("USB Error:", e)
-except ValueError as e:
-    print("Error:", e)
-
-except KeyboardInterrupt:
-    print("Ctrl+C pressed. Stopping...")
-
-finally:
-    if msr is not None:
-        msr.send_command([0xC2, 0x1B, 0x61])  # reset
-        msr.close()
-        print("Device closed. Exiting.")
+    present = ", ".join(str(number) for number in sorted(tracks))
+    print(f"Recorded track(s) {present} in {args.output!r}.", file=sys.stderr)
+    if service_codes:
+        for number, code in sorted(service_codes.items()):
+            classification = "ICC/EMV indicated" if code.icc_emv else "ICC/EMV not indicated"
+            print(
+                f"Track {number} service code: {code.value} ({classification}).",
+                file=sys.stderr,
+            )
+        if not service_codes_consistent(service_codes):
+            print(
+                "warning: Track 1 and Track 2 service codes disagree",
+                file=sys.stderr,
+            )
     else:
-        print("No device was initialized.")
+        print("No ISO payment-card service code was identified.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
