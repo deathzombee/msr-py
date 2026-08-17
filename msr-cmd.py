@@ -1,97 +1,170 @@
-import time
-import usb.core
-import usb.util
-import threading
-import queue
+#!/usr/bin/env python3
+"""Capture one card and export validated tracks for MagSpoof."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from msr import (
+    DEFAULT_BPI,
+    DecodeError,
+    MSRDevice,
+    MSRError,
+    decode_card_partial,
+    format_flipper_legacy_mag,
+    format_flipper_mag,
+    format_json,
+    format_magspoof,
+    identify_service_codes,
+    service_codes_consistent,
+    write_private,
+)
 
 
-class MSRDevice:
-    def __init__(self, vendor_id=0x0801, product_id=0x0003):
-        self.dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
-        if self.dev is None:
-            raise ValueError('Device not found')
+def parse_bpi(value: str) -> dict[int, int]:
+    """Parse Track 1/2/3 densities from a comma-separated CLI value."""
 
-        # Detach kernel driver and claim interface
-        if self.dev.is_kernel_driver_active(0):
-            self.dev.detach_kernel_driver(0)
-        usb.util.claim_interface(self.dev, 0)
-
-        self.endpoint_address = 0x81  # Endpoint 1 IN
-        self.size = 64  # Endpoint size in bytes
-
-        self.running = True
-        self.exit_event = threading.Event()
-        self.data_queue = queue.Queue()
-        self.read_thread = threading.Thread(target=self._read_thread)
-        self.read_thread.start()
-
-    def _read_thread(self):
-        """ Continuously read data from the device. """
-        while not self.exit_event.is_set():
-            try:
-                data = self.dev.read(self.endpoint_address, self.size, timeout=5000)
-                self.data_queue.put(data)
-            except usb.core.USBTimeoutError:
-                continue
-            except usb.core.USBError as err:
-                if err.errno == 19:
-                    break
-                else:
-                    raise
-
-    def send_command(self, command):
-        """ Send a command to the MSR device using control transfer. """
-        bmRequestType = 0x21  # Host to device | Class | Interface
-        bRequest = 9  # SET_REPORT
-        wValue = 0x300  # Feature
-        wIndex = 0  # Interface
-        command = self._extend(command)
-        self.dev.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, command)
-
-    @staticmethod
-    def _extend(command, length=64):
-        """ add padding to cmd bytes to match the endpoint size """
-        return command + [0x00] * (length - len(command))
-
-    def get_response(self):
-        """ Get the next response from the device. """
-        try:
-            return self.data_queue.get_nowait()
-        except queue.Empty:
-            return None
-
-    def close(self):
-        """ Release the interface and close connection"""
-        self.exit_event.set()
-        self.read_thread.join()
-        usb.util.release_interface(self.dev, 0)
-        usb.util.dispose_resources(self.dev)
+    try:
+        densities = [int(item.strip()) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("BPI must be three comma-separated numbers") from error
+    if len(densities) != 3 or any(density not in (75, 210) for density in densities):
+        raise argparse.ArgumentTypeError("BPI must be three values, each 75 or 210")
+    return {number: densities[number - 1] for number in (1, 2, 3)}
 
 
-msr = None
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Capture one authorized magnetic-stripe card for MagSpoof"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="output filename, created with owner-only permissions",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("flipper", "flipper-legacy", "magspoof", "json"),
+        help="output format (default: inferred from .mag/.json, otherwise magspoof)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds to wait for a swipe (default: 30)",
+    )
+    parser.add_argument(
+        "--read-mode",
+        choices=("iso", "raw"),
+        default="raw",
+        help="reader decoding mode (default: raw; iso uses firmware decoding)",
+    )
+    parser.add_argument(
+        "--bpi",
+        type=parse_bpi,
+        default=dict(DEFAULT_BPI),
+        metavar="T1,T2,T3",
+        help="raw track densities to save (default: 210,75,210)",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="replace an existing output file"
+    )
+    return parser.parse_args()
 
-try:
-    msr = MSRDevice()
-    msr.send_command([0xC5, 0x1B, 0x6d])  # read raw data
 
-    while True:
-        response = msr.get_response()
-        if response is not None:
-            print("Response:", response)
-            msr.send_command([0xC5, 0x1B, 0x6d])
-        time.sleep(0.5)
-except usb.core.USBError as e:
-    print("USB Error:", e)
-except ValueError as e:
-    print("Error:", e)
+def main() -> int:
+    args = parse_args()
+    if args.timeout <= 0:
+        print("error: --timeout must be greater than zero", file=sys.stderr)
+        return 2
 
-except KeyboardInterrupt:
-    print("Ctrl+C pressed. Stopping...")
+    output_format = args.format
+    if output_format is None:
+        lowered_output = args.output.lower()
+        if lowered_output.endswith(".mag"):
+            output_format = "flipper"
+        elif lowered_output.endswith(".json"):
+            output_format = "json"
+        else:
+            output_format = "magspoof"
 
-finally:
-    if msr is not None:
-        msr.send_command([0xC2, 0x1B, 0x61])  # reset
-        msr.close()
-        print("Device closed. Exiting.")
+    try:
+        print("Reader ready; swipe one card...", file=sys.stderr)
+        raw_card = None
+        decode_errors = {}
+        with MSRDevice() as device:
+            if args.read_mode == "raw":
+                raw_card = device.capture_raw_card(args.timeout)
+                tracks, decode_errors = decode_card_partial(raw_card)
+            else:
+                tracks = device.capture_iso(args.timeout)
+        if output_format != "json" and decode_errors:
+            first_number = min(decode_errors)
+            raise DecodeError(decode_errors[first_number])
+        service_codes = identify_service_codes(tracks)
+        formatters = {
+            "flipper": format_flipper_mag,
+            "flipper-legacy": format_flipper_legacy_mag,
+            "magspoof": format_magspoof,
+            "json": format_json,
+        }
+        content = (
+            format_json(
+                tracks,
+                raw_card=raw_card,
+                bpi=args.bpi,
+                decode_errors=decode_errors,
+            )
+            if output_format == "json"
+            else formatters[output_format](tracks)
+        )
+        write_private(args.output, content, overwrite=args.force)
+    except KeyboardInterrupt:
+        print("\nCapture cancelled.", file=sys.stderr)
+        return 130
+    except FileExistsError:
+        print(
+            f"error: {args.output!r} already exists; use --force to replace it",
+            file=sys.stderr,
+        )
+        return 1
+    except (MSRError, OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    present_tracks = (
+        [number for number, raw in raw_card.tracks.items() if raw]
+        if raw_card is not None
+        else sorted(tracks)
+    )
+    present = ", ".join(str(number) for number in present_tracks)
+    print(f"Recorded track(s) {present} in {args.output!r}.", file=sys.stderr)
+    for number, track in sorted(tracks.items()):
+        if track.direction == "reverse":
+            print(f"Track {number} decoded in reverse direction.", file=sys.stderr)
+    for number in sorted(decode_errors):
+        print(
+            f"Track {number} was preserved as raw data but did not decode as ISO.",
+            file=sys.stderr,
+        )
+    if service_codes:
+        for number, code in sorted(service_codes.items()):
+            classification = "ICC/EMV indicated" if code.icc_emv else "ICC/EMV not indicated"
+            print(
+                f"Track {number} service code: {code.value} ({classification}).",
+                file=sys.stderr,
+            )
+        if not service_codes_consistent(service_codes):
+            print(
+                "warning: Track 1 and Track 2 service codes disagree",
+                file=sys.stderr,
+            )
     else:
-        print("No device was initialized.")
+        print("No ISO payment-card service code was identified.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
